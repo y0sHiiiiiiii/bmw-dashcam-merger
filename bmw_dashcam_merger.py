@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -28,6 +28,17 @@ CAM_ALIASES = {
 KAMERA_WORDS = ['Kamera', 'Camera']
 RAW_SUFFIXES = ['_Rohdaten', '_Raw']
 NORMAL_SUFFIXES = ['']
+
+# Telemetry XML tags. The car's USB export uses DATE_UTC/TIME_UTC and follows
+# the car's locale for the date format and speed unit (e.g. VELOCITY_MPH and
+# DD/MM/YYYY on UK cars). The My BMW app export uses DATE/TIME (also UTC).
+DATE_TAGS = ('DATE_UTC', 'DATE')
+TIME_TAGS = ('TIME_UTC', 'TIME')
+SPEED_TAGS = (('VELOCITY_KMH', 'kmh'), ('VELOCITY_MPH', 'mph'))
+KMH_PER_MPH = 1.609344
+UNIT_LABELS = {'kmh': 'km/h', 'mph': 'mph'}
+
+_DATE_RE = re.compile(r'^(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})$')
 
 
 def _ensure_utf8_stdout():
@@ -108,6 +119,12 @@ def parse_arguments():
                         help='Lossless encoding with libx264 crf 0 (CPU only)')
     parser.add_argument('--font', type=str, default=None,
                         help='Path to a .ttf/.otf font for the HUD (default: auto-detect)')
+    parser.add_argument('--units', type=str, default='auto',
+                        choices=['auto', 'kmh', 'mph'],
+                        help='Speed unit shown in the HUD (default: auto = same unit as the XML)')
+    parser.add_argument('--date-format', type=str, default='auto',
+                        choices=['auto', 'dmy', 'mdy', 'ymd'],
+                        help='Date order in the XML (default: auto-detect). Use mdy for US-style MM/DD/YYYY dates.')
 
     return parser.parse_args()
 
@@ -201,24 +218,119 @@ def build_dummy_telemetry(duration_seconds: float):
     return [{'time': i, 'display_time': f'00:00:{i:02d}', 'velocity': 0.0} for i in range(n)]
 
 
-def parse_xml_telemetry(xml_path, tz_offset_hours, time_offset_seconds):
-    """Parse XML telemetry (time + speed). Falls back to dummy data on error."""
+def _find_text(entry, tags):
+    """Return the stripped text of the first tag in `tags` present in `entry`."""
+    for tag in tags:
+        el = entry.find(tag)
+        if el is not None and el.text and el.text.strip():
+            return el.text.strip()
+    return None
+
+
+def _split_date(date_str):
+    m = _DATE_RE.match(date_str)
+    if not m:
+        raise ValueError(f"unrecognized date {date_str!r}")
+    return tuple(int(x) for x in m.groups())
+
+
+def detect_date_order(date_strings):
+    """Guess the field order ('dmy', 'mdy' or 'ymd') from all dates in a file.
+
+    Returns (order, ambiguous). When no value above 12 shows whether
+    slash-separated dates are DD/MM (UK/EU) or MM/DD (US), 'dmy' is assumed.
+    The HUD only shows the time, and dates only matter for the offset
+    between entries, so `ambiguous` is True only if the recording also
+    spans more than one date (i.e. crosses midnight).
+    """
+    parts = [_split_date(s) for s in date_strings if _DATE_RE.match(s)]
+    if not parts:
+        return 'dmy', False
+    if any(p[0] > 31 for p in parts):
+        return 'ymd', False
+    if any(p[0] > 12 for p in parts):
+        return 'dmy', False
+    if any(p[1] > 12 for p in parts):
+        return 'mdy', False
+    return 'dmy', any('/' in s for s in date_strings) and len(set(parts)) > 1
+
+
+def _parse_date(date_str, order):
+    a, b, c = _split_date(date_str)
+    if order == 'ymd':
+        y, m, d = a, b, c
+    elif order == 'mdy':
+        m, d, y = a, b, c
+    else:
+        d, m, y = a, b, c
+    if y < 100:
+        y += 2000
+    return date(y, m, d)
+
+
+def _parse_time(time_str):
+    """Parse 24h (HH:MM:SS) or 12h (HH:MM:SS AM/PM) times."""
+    s = time_str.strip().upper()
+    for fmt in ('%H:%M:%S', '%H:%M:%S.%f', '%I:%M:%S %p', '%I:%M:%S%p'):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            pass
+    raise ValueError(f"unrecognized time {time_str!r}")
+
+
+def _read_speed_kmh(entry):
+    """Return (speed in km/h, source unit) for an ENTRY."""
+    for tag, unit in SPEED_TAGS:
+        text = _find_text(entry, (tag,))
+        if text is not None:
+            value = float(text.replace(',', '.'))
+            return (value * KMH_PER_MPH if unit == 'mph' else value), unit
+    raise ValueError(f"no speed tag (expected one of {', '.join(t for t, _ in SPEED_TAGS)})")
+
+
+def parse_xml_telemetry(xml_path, tz_offset_hours, time_offset_seconds, date_format='auto'):
+    """Parse XML telemetry (time + speed).
+
+    Handles the car's USB export in any locale (DATE_UTC/TIME_UTC,
+    VELOCITY_KMH or VELOCITY_MPH, '.', '/' or '-' separated dates) and the
+    My BMW app export (DATE/TIME). Speeds are returned in km/h.
+
+    Returns (telemetry_data, source_unit). Falls back to dummy data with
+    source_unit None on error.
+    """
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
+        entries = root.findall('.//ENTRY')
+
+        if date_format == 'auto':
+            dates = [d for d in (_find_text(e, DATE_TAGS) for e in entries) if d]
+            date_order, ambiguous = detect_date_order(dates)
+            if ambiguous:
+                print("NOTE: recording crosses midnight and XML dates could be DD/MM/YYYY or "
+                      "MM/DD/YYYY; assuming DD/MM/YYYY. Pass --date-format mdy if your car uses "
+                      "US-style dates.")
+        else:
+            date_order = date_format
 
         telemetry_data = []
         skipped = 0
+        first_error = None
         start_time = None
+        source_unit = None
 
-        for entry in root.findall('.//ENTRY'):
+        for entry in entries:
             try:
-                date_str = entry.find('DATE_UTC').text   # DD.MM.YYYY
-                time_str = entry.find('TIME_UTC').text   # HH:MM:SS
-                velocity_str = entry.find('VELOCITY_KMH').text
+                date_str = _find_text(entry, DATE_TAGS)
+                time_str = _find_text(entry, TIME_TAGS)
+                if date_str is None or time_str is None:
+                    raise ValueError(f"missing date/time tag (expected {'/'.join(DATE_TAGS)} and {'/'.join(TIME_TAGS)})")
 
-                dt_str = f"{date_str} {time_str}"
-                dt_utc = datetime.strptime(dt_str, '%d.%m.%Y %H:%M:%S')
+                dt_utc = datetime.combine(_parse_date(date_str, date_order), _parse_time(time_str))
+                velocity_kmh, unit = _read_speed_kmh(entry)
+                if source_unit is None:
+                    source_unit = unit
 
                 dt_local = dt_utc + timedelta(hours=tz_offset_hours, seconds=time_offset_seconds)
 
@@ -230,31 +342,34 @@ def parse_xml_telemetry(xml_path, tz_offset_hours, time_offset_seconds):
                 telemetry_data.append({
                     'time': seconds_offset,
                     'display_time': dt_local.strftime('%H:%M:%S'),
-                    'velocity': float(velocity_str)
+                    'velocity': velocity_kmh,
                 })
-            except Exception:
+            except Exception as e:
                 skipped += 1
+                if first_error is None:
+                    first_error = e
                 continue
 
         if skipped:
-            print(f"NOTE: skipped {skipped} XML entries (parse error).")
+            print(f"NOTE: skipped {skipped} of {len(entries)} XML entries (first error: {first_error}).")
 
         if not telemetry_data:
-            print("WARNING: No telemetry data found in XML. Using dummy data.")
-            return build_dummy_telemetry(60)
+            print("WARNING: No usable telemetry data found in XML. HUD will show dummy data (0 km/h).")
+            return build_dummy_telemetry(60), None
 
+        print(f"Telemetry: speed unit in XML = {UNIT_LABELS[source_unit]}, date order = {date_order}")
         print(f"First telemetry: time={telemetry_data[0]['display_time']}, speed={telemetry_data[0]['velocity']:.1f} km/h")
         print(f"Last telemetry:  time={telemetry_data[-1]['display_time']}, speed={telemetry_data[-1]['velocity']:.1f} km/h")
 
-        return telemetry_data
+        return telemetry_data, source_unit
 
     except Exception as e:
         print(f"ERROR parsing XML: {e}")
         print("Using dummy data.")
-        return build_dummy_telemetry(60)
+        return build_dummy_telemetry(60), None
 
 
-def create_hud_drawtext_filters(telemetry_data, duration, font_path):
+def create_hud_drawtext_filters(telemetry_data, duration, font_path, speed_unit='kmh'):
     """Build a drawtext filter chain that shows speed + time per second."""
     data_per_second = {}
     for data in telemetry_data:
@@ -263,18 +378,20 @@ def create_hud_drawtext_filters(telemetry_data, duration, font_path):
             data_per_second[second] = data
 
     font_part = f"fontfile={_filter_path(font_path)}:" if font_path else ""
+    unit_label = UNIT_LABELS[speed_unit]
+    divisor = KMH_PER_MPH if speed_unit == 'mph' else 1.0
 
     filters = []
     for second in sorted(data_per_second.keys()):
         data = data_per_second[second]
         time_text = data['display_time'].replace(':', '\\:')
-        speed_text = f"{data['velocity']:.0f}"
+        speed_text = f"{data['velocity'] / divisor:.0f}"
         start_time = second
         end_time = second + 1
 
         speed_filter = (
             f"drawtext={font_part}"
-            f"text='{speed_text} km/h':"
+            f"text='{speed_text} {unit_label}':"
             f"fontcolor=white:fontsize=70:"
             f"box=1:boxcolor=black@0.8:boxborderw=10:"
             f"x=w-tw-80:y=h-th-80:"
@@ -296,7 +413,7 @@ def create_hud_drawtext_filters(telemetry_data, duration, font_path):
     return ','.join(filters)
 
 
-def build_ffmpeg_command(args, video_files, telemetry_data, output_file, min_duration, font_path):
+def build_ffmpeg_command(args, video_files, telemetry_data, output_file, min_duration, font_path, speed_unit='kmh'):
     """Build the ffmpeg command (inline -filter_complex). Very long videos
     (several thousand seconds) may exceed the OS command-line length limit;
     typical dashcam clips are short enough that inline is fine and avoids
@@ -313,7 +430,7 @@ def build_ffmpeg_command(args, video_files, telemetry_data, output_file, min_dur
         encoder_opts = ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23']
 
     print("Building dynamic HUD...")
-    hud_filters = create_hud_drawtext_filters(telemetry_data, min_duration, font_path)
+    hud_filters = create_hud_drawtext_filters(telemetry_data, min_duration, font_path, speed_unit)
 
     scale_chain = ("fps=30,scale=1216:960:force_original_aspect_ratio=decrease,"
                    "pad=1216:960:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
@@ -387,6 +504,7 @@ def process_video_set(args, video_type, font_path):
     print(f"\nShortest duration: {min_duration:.2f} seconds - output will be trimmed to this length.")
 
     xml_path = Path(args.xml) if getattr(args, "xml", None) else None
+    source_unit = None
     if (xml_path is None) or (not xml_path.exists()):
         if xml_path is None:
             print("\nWARNING: No XML file provided/found - HUD will use dummy telemetry (0 km/h).")
@@ -396,15 +514,18 @@ def process_video_set(args, video_type, font_path):
         print(f"Telemetry entries (dummy): {len(telemetry_data)}")
     else:
         print(f"\nParsing telemetry from: {xml_path}")
-        telemetry_data = parse_xml_telemetry(xml_path, args.tz, args.offset)
+        telemetry_data, source_unit = parse_xml_telemetry(xml_path, args.tz, args.offset, args.date_format)
         print(f"Telemetry entries: {len(telemetry_data)}")
+
+    speed_unit = args.units if args.units != 'auto' else (source_unit or 'kmh')
+    print(f"HUD speed unit: {UNIT_LABELS[speed_unit]}")
 
     output_file = base_dir / f"{prefix}_{video_type}_LAYOUT_hud.mp4"
     print(f"\nEncoding with FFmpeg...")
     print(f"Hardware encoder: {args.hwenc}")
     print(f"Output: {output_file}")
 
-    cmd = build_ffmpeg_command(args, video_files, telemetry_data, output_file, min_duration, font_path)
+    cmd = build_ffmpeg_command(args, video_files, telemetry_data, output_file, min_duration, font_path, speed_unit)
 
     try:
         subprocess.run(cmd, check=True)

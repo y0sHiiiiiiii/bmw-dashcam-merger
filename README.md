@@ -14,7 +14,9 @@ Linux.
 ## Features
 
 - Merges the four BMW dashcam camera streams into one 3648x1920 layout video
-- Burns a HUD with speed (km/h) and timestamp from the dashcam's XML telemetry
+- Burns a HUD with speed (km/h or mph) and timestamp from the dashcam's XML telemetry
+- Reads telemetry XML in any car locale (km/h or mph, `13.11.2026`,
+  `13/11/2026`, `11/13/2026` dates), as well as the My BMW app export
 - Processes both normal and raw recordings in a single run, skipping whichever
   variant is missing
 - Batch mode (`--tag`) processes every matching recording in a folder
@@ -97,6 +99,24 @@ python bmw_dashcam_merger.py --prefix 2026-05-13_07-36-36_Manuell --xml my_telem
 If `--xml` is omitted, the script looks for `<prefix>.xml` next to the videos.
 If no XML is found, the HUD falls back to dummy data (0 km/h, dummy clock).
 
+### Telemetry XML formats
+
+The XML exported by the car to USB follows the car's locale settings, so the
+script accepts:
+
+| Source                 | Date / time tags         | Date format                  | Speed tag                       |
+|------------------------|--------------------------|------------------------------|---------------------------------|
+| Car → USB (German)     | `DATE_UTC` / `TIME_UTC`  | `13.11.2026`                 | `VELOCITY_KMH`                  |
+| Car → USB (UK)         | `DATE_UTC` / `TIME_UTC`  | `13/11/2026`                 | `VELOCITY_MPH`                  |
+| Car → USB (US)         | `DATE_UTC` / `TIME_UTC`  | `11/13/2026`                 | `VELOCITY_MPH`                  |
+| My BMW app export      | `DATE` / `TIME`          | `13.11.2026`                 | `VELOCITY_KMH`                  |
+
+The HUD shows speed in the same unit as the XML; override with
+`--units kmh` or `--units mph`. The date order is detected automatically;
+slash dates that could be either `DD/MM` or `MM/DD` are read as `DD/MM`. This
+only matters for recordings that cross midnight. Pass `--date-format mdy` for
+US-style dates in that case.
+
 ### Hardware encoding
 
 Append `--hwenc` to any of the commands above. Replace `<PREFIX>` with your
@@ -140,6 +160,8 @@ loss.
 | `--hwenc`     | `cpu`   | One of `cpu` / `nvenc` / `amf` / `qsv`                                                       |
 | `--lossless`  | off     | Use lossless `libx264 -crf 0` (CPU only)                                                     |
 | `--font`      | auto    | Path to a TTF/OTF font for the HUD                                                           |
+| `--units`     | `auto`  | HUD speed unit: `auto` (same as the XML), `kmh`, or `mph`                                    |
+| `--date-format` | `auto` | XML date order: `auto`, `dmy`, `mdy`, or `ymd`                                              |
 
 ---
 
@@ -223,6 +245,12 @@ has no audio track, the output has none either.
 
 **HUD looks wrong / wrong font**
 Pass `--font` with the explicit path to a TTF you want to use.
+
+**HUD shows 0 km/h even though an XML file exists**
+The script prints `NOTE: skipped N of M XML entries (first error: ...)` with
+the reason. If your XML uses tags not listed under
+[Telemetry XML formats](#telemetry-xml-formats), please open an issue with a
+sample `<ENTRY>`.
 
 **Time in the HUD is off by an hour**
 Adjust `--tz` (e.g. `--tz 2` for CEST summer time).
